@@ -1,0 +1,437 @@
+#!/bin/bash
+
+# ===================================================================
+# AI Assistant Full Deploy — LibreY + Qwen2.5:0.5b + Web UI
+# - LibreY: di-deploy via Docker di /var/www/librey
+# - LLM: Qwen2.5:0.5b via Ollama
+# - UI: PHP frontend di /var/www/ai (mirip GPT/Qwen)
+# - Fitur: history, fly [query], dark/light mode, responsive
+# ===================================================================
+
+set -e
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
+
+# === 1. Periksa dependensi ===
+log "Memeriksa dependensi..."
+for cmd in docker docker-compose curl apache2 php; do
+    if ! command -v "$cmd" &> /dev/null; then
+        error "Diperlukan: $cmd. Instal terlebih dahulu."
+    fi
+done
+if ! php -m | grep -q curl; then
+    error "PHP curl tidak aktif. Jalankan: sudo apt install php-curl"
+fi
+
+# === 2. Deploy LibreY (jika belum ada) ===
+LIBREY_DIR="/var/www/librey"
+if [ ! -d "$LIBREY_DIR" ]; then
+    log "Mengunduh LibreY ke $LIBREY_DIR..."
+    sudo mkdir -p "$LIBREY_DIR"
+    sudo chown -R "$(whoami):$(whoami)" "$LIBREY_DIR"
+    git clone https://github.com/Ahwxorg/Librey.git "$LIBREY_DIR"
+else
+    log "LibreY sudah ada di $LIBREY_DIR"
+fi
+
+# Buat docker-compose.yml untuk LibreY
+cat > "$LIBREY_DIR/docker-compose.yml" << 'EOF'
+version: '3'
+services:
+  librey:
+    image: ahwx/librey:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+EOF
+
+# Jalankan LibreY
+log "Menjalankan LibreY via Docker..."
+cd "$LIBREY_DIR"
+docker-compose up -d
+
+# Tunggu hingga siap
+sleep 5
+if ! curl -sf http://localhost:8080 >/dev/null; then
+    error "Gagal menjalankan LibreY. Periksa docker logs librey_librey_1"
+fi
+log "✅ LibreY aktif di http://localhost:8080"
+
+# === 3. Deploy Ollama + Qwen2.5:0.5b ===
+log "Memastikan Ollama berjalan..."
+if ! systemctl is-active --quiet ollama; then
+    if ! command -v ollama &> /dev/null; then
+        log "Menginstal Ollama..."
+        curl -fsSL https://ollama.com/install.sh | sh
+    fi
+    sudo systemctl enable ollama
+    sudo systemctl start ollama
+fi
+
+log "Mengunduh model Qwen2.5:0.5b..."
+if ! ollama list | grep -q "qwen2.5:0.5b"; then
+    ollama pull qwen2.5:0.5b
+else
+    log "Model qwen2.5:0.5b sudah tersedia"
+fi
+
+# Uji Ollama
+if ! curl -sf http://localhost:11434 >/dev/null; then
+    error "Ollama tidak merespons di port 11434"
+fi
+log "✅ Qwen2.5:0.5b siap digunakan"
+
+# === 4. Siapkan direktori UI ===
+APP_DIR="/var/www/ai"
+sudo mkdir -p "$APP_DIR"/{static/css,static/js}
+sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
+
+# === 5. Buat file PHP ===
+
+# ollama-proxy.php
+cat > "$APP_DIR/ollama-proxy.php" << 'EOF'
+<?php
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['error' => 'Method not allowed']);
+    exit;
+}
+
+$input = json_decode(file_get_contents('php://input'), true);
+if (!$input || !isset($input['prompt'])) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Invalid input']);
+    exit;
+}
+
+$url = 'http://localhost:11434/api/generate';
+$data = [
+    'model' => 'qwen2.5:0.5b',
+    'prompt' => $input['prompt'],
+    'stream' => false
+];
+
+$ch = curl_init($url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+
+$response = curl_exec($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$error = curl_error($ch);
+curl_close($ch);
+
+if ($error) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Ollama connection failed']);
+    exit;
+}
+
+if ($httpCode !== 200) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Ollama error']);
+    exit;
+}
+
+echo $response;
+?>
+EOF
+
+# librey-proxy.php
+cat > "$APP_DIR/librey-proxy.php" << 'EOF'
+<?php
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+
+$query = $_GET['q'] ?? '';
+if (!$query) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Missing query']);
+    exit;
+}
+
+$libreyUrl = 'http://localhost:8080/search.php?q=' . urlencode($query);
+
+$ch = curl_init($libreyUrl);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+curl_setopt($ch, CURLOPT_USERAGENT, 'AI-Assistant/1.0');
+
+$response = curl_exec($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
+
+if ($httpCode !== 200) {
+    http_response_code(502);
+    echo json_encode(['error' => 'LibreY unreachable']);
+    exit;
+}
+
+libxml_use_internal_errors(true);
+$doc = new DOMDocument();
+$doc->loadHTML($response);
+
+$results = [];
+$items = $doc->getElementsByTagName('div');
+foreach ($items as $item) {
+    if ($item->getAttribute('class') === 'result') {
+        $a = $item->getElementsByTagName('a')->item(0);
+        $title = $a ? trim($a->textContent) : '';
+        $url = $a ? $a->getAttribute('href') : '';
+        $snippet = '';
+        foreach ($item->childNodes as $child) {
+            if ($child->nodeType === XML_TEXT_NODE && trim($child->textContent)) {
+                $snippet = trim($child->textContent);
+                break;
+            }
+        }
+        if ($title || $url) {
+            $results[] = ['title' => $title, 'url' => $url, 'description' => $snippet];
+        }
+    }
+    if (count($results) >= 3) break;
+}
+
+echo json_encode(['results' => $results]);
+?>
+EOF
+
+# index.php
+cat > "$APP_DIR/index.php" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>AI Assistant</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=1.0" />
+</head>
+<body class="dark">
+    <button id="theme-toggle" onclick="toggleTheme()">🌓</button>
+
+    <div id="chat"></div>
+
+    <div id="input-area">
+        <input type="text" id="message" placeholder="Ketik pesan atau 'fly [pertanyaan]'..." autocomplete="off" />
+        <button id="send" onclick="sendMessage()">➤</button>
+    </div>
+
+    <script src="/static/js/main.js?v=1.0"></script>
+</body>
+</html>
+EOF
+
+# === 6. CSS ===
+cat > "$APP_DIR/static/css/style.css" << 'EOF'
+:root {
+  --bg: #000;
+  --fg: #fff;
+  --user-bg: #333;
+  --ai-bg: #222;
+  --border: #444;
+  --button: #555;
+  --hover: #666;
+}
+
+body.light {
+  --bg: #fff;
+  --fg: #000;
+  --user-bg: #e0e0e0;
+  --ai-bg: #f0f0f0;
+  --border: #ccc;
+  --button: #ddd;
+  --hover: #bbb;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+#chat {
+  flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:1rem;
+}
+.msg {
+  max-width:90%; padding:0.75rem 1rem; border-radius:12px; line-height:1.5; word-break:break-word;
+}
+.user { background:var(--user-bg); align-self:flex-end; }
+.ai { background:var(--ai-bg); align-self:flex-start; }
+.thinking { opacity:0.7; font-style:italic; }
+.search { margin-top:0.5rem; font-size:0.9em; }
+#input-area {
+  display:flex; padding:1rem; gap:0.5rem; background:var(--bg); border-top:1px solid var(--border);
+}
+#message {
+  flex:1; padding:0.75rem; border:1px solid var(--border); border-radius:24px;
+  background:var(--bg); color:var(--fg); outline:none;
+}
+#message:focus { border-color:var(--hover); }
+button {
+  background:var(--button); border:none; border-radius:50%; width:44px; height:44px;
+  color:var(--fg); cursor:pointer; display:flex; align-items:center; justify-content:center;
+}
+button:hover { background:var(--hover); }
+#theme-toggle {
+  position:absolute; top:1rem; right:1rem; border-radius:8px; width:auto; padding:0 12px;
+}
+@media (max-width:600px) { .msg { max-width:95%; } }
+EOF
+
+# === 7. JavaScript ===
+cat > "$APP_DIR/static/js/main.js" << 'EOF'
+document.addEventListener('DOMContentLoaded', () => {
+  const chatBox = document.getElementById('chat');
+  const input = document.getElementById('message');
+  const sendBtn = document.getElementById('send');
+  const themeToggle = document.getElementById('theme-toggle');
+
+  const savedTheme = localStorage.getItem('theme') || 'dark';
+  document.body.className = savedTheme;
+
+  window.toggleTheme = () => {
+    const newTheme = document.body.classList.contains('dark') ? 'light' : 'dark';
+    document.body.className = newTheme;
+    localStorage.setItem('theme', newTheme);
+  };
+
+  const loadHistory = () => {
+    const hist = JSON.parse(localStorage.getItem('chatHistory') || '[]');
+    hist.forEach(msg => addMessage(msg.text, msg.role));
+  };
+  loadHistory();
+
+  const addMessage = (html, role) => {
+    const div = document.createElement('div');
+    div.className = `msg ${role}`;
+    div.innerHTML = html;
+    chatBox.appendChild(div);
+    chatBox.scrollTo(0, chatBox.scrollHeight);
+  };
+
+  const showThinking = () => {
+    const div = document.createElement('div');
+    div.className = 'msg ai thinking';
+    div.id = 'thinking';
+    div.textContent = 'Mengetik...';
+    chatBox.appendChild(div);
+    chatBox.scrollTo(0, chatBox.scrollHeight);
+  };
+
+  const hideThinking = () => {
+    const el = document.getElementById('thinking');
+    if (el) el.remove();
+  };
+
+  window.sendMessage = async () => {
+    const userMsg = input.value.trim();
+    if (!userMsg) return;
+    input.value = '';
+
+    addMessage(userMsg, 'user');
+    const hist = JSON.parse(localStorage.getItem('chatHistory') || '[]');
+    hist.push({ text: userMsg, role: 'user' });
+
+    if (userMsg.toLowerCase().startsWith('fly ')) {
+      const query = userMsg.substring(4).trim();
+      if (!query) {
+        addMessage('🔍 Gunakan: <code>fly [pertanyaan]</code>', 'ai');
+        hist.push({ text: 'Instruksi pencarian', role: 'ai' });
+        localStorage.setItem('chatHistory', JSON.stringify(hist));
+        return;
+      }
+
+      addMessage(`🔍 Mencari: <b>${query}</b>`, 'ai');
+      try {
+        const res = await fetch(`/librey-proxy.php?q=${encodeURIComponent(query)}`);
+        const data = await res.json();
+        if (data.results && data.results.length > 0) {
+          let reply = '';
+          data.results.forEach(r => {
+            reply += `<div class="search">📄 <a href="${r.url}" target="_blank">${r.title}</a><br>${r.description}</div><br>`;
+          });
+          addMessage(reply, 'ai');
+        } else {
+          addMessage('❌ Tidak ada hasil ditemukan.', 'ai');
+        }
+      } catch (e) {
+        addMessage('❌ Gagal menghubungi LibreY.', 'ai');
+      }
+      hist.push({ text: 'Hasil pencarian', role: 'ai' });
+      localStorage.setItem('chatHistory', JSON.stringify(hist));
+      return;
+    }
+
+    showThinking();
+    try {
+      const resp = await fetch('/ollama-proxy.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: userMsg })
+      });
+      const data = await resp.json();
+      hideThinking();
+      const aiMsg = data.response?.trim() || 'Maaf, saya tidak mengerti.';
+      addMessage(aiMsg, 'ai');
+      hist.push({ text: aiMsg, role: 'ai' });
+      localStorage.setItem('chatHistory', JSON.stringify(hist));
+    } catch (e) {
+      hideThinking();
+      addMessage('❌ Gagal terhubung ke AI.', 'ai');
+    }
+  };
+
+  sendBtn.onclick = sendMessage;
+  input.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+});
+EOF
+
+# === 8. Atur permission & Apache ===
+sudo chown -R www-data:www-data "$APP_DIR"
+sudo chmod -R 755 "$APP_DIR"
+
+# Ubah DocumentRoot Apache ke /var/www/ai
+sudo sed -i 's|DocumentRoot /var/www/html|DocumentRoot /var/www/ai|g' /etc/apache2/sites-available/000-default.conf
+sudo systemctl restart apache2
+
+# === 9. Selesai ===
+IP=$(hostname -I | awk '{print $1}' | head -n1)
+log ""
+log "🚀 DEPLOYMENT SELESAI!"
+log ""
+log "Buka di browser: http://$IP"
+log ""
+log "Fitur:"
+log "- Chat dengan Qwen2.5:0.5b"
+log "- Ketik 'fly [query]' untuk cari via LibreY"
+log "- Riwayat tersimpan di browser"
+log "- Tema gelap/terang (tombol 🌓)"
+log "- Responsif untuk semua perangkat"
+log ""
+log "Catatan:"
+log "- LibreY: http://$IP:8080"
+log "- Jika ada masalah, cek: docker ps, systemctl status ollama, systemctl status apache2"
