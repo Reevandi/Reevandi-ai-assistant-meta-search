@@ -32,3 +32,5 @@ An automated Bash script is provided to deploy
 the frontend components of the AI assistant.
 
 📁 Script location:
+1. setup/setup-ai-frontend (only frontend)
+2. setup/setup-ai-full
